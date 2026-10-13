@@ -1,10 +1,10 @@
 # Lara
 
-Lara (Lightweight Advanced Representation Architecture) is a PyTorch encoder-only Transformer for bidirectional text representations. It combines dynamic NTK-scaled RoPE, pre-norm RMSNorm, SwiGLU feed-forward layers, and local/global attention. PyTorch's scaled dot-product attention API dispatches to an optimized backend when the device and inputs support it.
+Lara (Lightweight Advanced Representation Architecture) is a PyTorch encoder-only Transformer for bidirectional text representations. It combines dynamic NTK-scaled RoPE, pre-norm RMSNorm, SwiGLU feed-forward layers, local/global attention, and BERT-style WordPiece tokenization. PyTorch's scaled dot-product attention API dispatches to an optimized backend when the device and inputs support it.
 
 ## Install
 
-Lara requires PyTorch 2.0 or newer, NumPy, and Safetensors. Install the PyTorch wheel for your hardware using the official [PyTorch installation selector](https://pytorch.org/get-started/locally/), then install Lara:
+Lara requires PyTorch 2.0 or newer, NumPy, Safetensors, and Hugging Face Tokenizers. Install the PyTorch wheel for your hardware using the official [PyTorch installation selector](https://pytorch.org/get-started/locally/), then install Lara:
 
 ```bash
 python -m pip install .
@@ -19,15 +19,24 @@ python -m pip install -e ".[dev]"
 
 ## Quick Start
 
-Lara accepts token IDs; it does not include a tokenizer. Use IDs from your BPE tokenizer, including its byte-fallback tokens if configured, and set `vocab_size` to match that tokenizer. In `attention_mask`, `1` marks a real token and `0` marks padding.
+Load a BERT-compatible WordPiece vocabulary. The tokenizer adds `[CLS]`/`[SEP]`, emits segment IDs for sentence pairs, and pads batches. In `attention_mask`, `1` marks a real token and `0` marks padding.
 
 ```python
 import torch
 
 from lara import LaraConfig, LaraModel
+from lara_tokenizer import LaraTokenizer
 
+tokenizer = LaraTokenizer.from_vocab_file("vocab.txt")
+batch = tokenizer(
+    ["A first sentence.", "Another example."],
+    text_pair=["Its paired text.", "A second segment."],
+    padding=True,
+    truncation=True,
+    max_length=128,
+)
 config = LaraConfig(
-    vocab_size=32_000,
+    vocab_size=len(tokenizer),
     hidden_size=256,
     num_hidden_layers=4,
     num_attention_heads=8,
@@ -36,17 +45,39 @@ config = LaraConfig(
     num_global_tokens=1,
 )
 model = LaraModel(config)
-
-input_ids = torch.randint(1, config.vocab_size, (2, 512))
-attention_mask = torch.ones_like(input_ids)
-attention_mask[1, 400:] = 0
-outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+outputs = model(**batch)
 
 print(outputs.last_hidden_state.shape)  # [batch, sequence, hidden]
 print(outputs.pooler_output.shape)      # [batch, hidden]
 ```
 
-For classification, use `LaraForSequenceClassification(config, num_labels=...)`; it returns `logits` and, when `labels` are supplied, cross-entropy `loss`. `LaraForRetrieval(config)` returns L2-normalized pooled vectors suitable for similarity scoring.
+## BERT Tasks
+
+The encoder supports `token_type_ids` for paired text. Task heads are available for sequence classification (`LaraForSequenceClassification`), token classification (`LaraForTokenClassification`), extractive question answering (`LaraForQuestionAnswering`), and multiple choice (`LaraForMultipleChoice`). `LaraForMaskedLM` provides the tied-weight masked-token prediction head; `LaraForPreTraining` combines masked language modeling with next-sentence prediction. These heads return logits and calculate losses when labels are supplied. `LaraForRetrieval` remains available for normalized embedding vectors.
+
+For MLM batches, `LaraDataCollatorForLanguageModeling` dynamically pads tokenized examples, selects non-special tokens, applies BERT's 80/10/10 mask/random/unchanged corruption, and creates `-100` ignore labels:
+
+```python
+from lara import LaraConfig, LaraForMaskedLM
+from lara_tokenizer import LaraDataCollatorForLanguageModeling, LaraTokenizer
+
+tokenizer = LaraTokenizer.from_vocab_file("vocab.txt")
+encoded = tokenizer(
+    ["A training example.", "A second example."],
+    padding=False,
+    return_tensors=None,
+    return_special_tokens_mask=True,
+)
+features = [
+    {name: values[index] for name, values in encoded.items()}
+    for index in range(len(encoded["input_ids"]))
+]
+batch = LaraDataCollatorForLanguageModeling(tokenizer)(features)
+model = LaraForMaskedLM(LaraConfig(vocab_size=len(tokenizer)))
+loss = model(**batch).loss
+```
+
+For next-sentence pretraining, pass paired encodings and `next_sentence_labels` to `LaraForPreTraining`; sentence-pair construction and negative-example sampling are dataset responsibilities.
 
 Save and reload the base encoder with `config.json` and `model.safetensors`:
 
@@ -55,7 +86,14 @@ model.save_pretrained("lara-checkpoint")
 restored_model = LaraModel.from_pretrained("lara-checkpoint")
 ```
 
-`LaraConfig.save_pretrained()` and `LaraConfig.from_pretrained()` can also save and load the configuration on its own. Task-specific wrappers currently do not provide separate save/load helpers.
+Task heads have the same `save_pretrained()` and `from_pretrained()` methods. For example, a fine-tuned classifier saves its label count and head weights alongside the encoder:
+
+```python
+classifier.save_pretrained("lara-classifier")
+classifier = LaraForSequenceClassification.from_pretrained("lara-classifier")
+```
+
+`LaraConfig.save_pretrained()` and `LaraConfig.from_pretrained()` can also save and load the configuration on its own.
 
 ## Attention and Context
 
@@ -65,7 +103,7 @@ RoPE uses dynamic NTK scaling beyond `max_position_embeddings` (32,768 by defaul
 
 ## Scope
 
-Lara is a BERT-like architecture, not a drop-in BERT or ModernBERT replacement. It does not include a tokenizer, pretrained weights, a masked-language-modeling head, checkpoint conversion, or benchmark results. The model is randomly initialized and must be trained or fine-tuned for useful representations; compatibility with existing BERT-family checkpoints is not provided.
+Lara implements common BERT task heads and a WordPiece workflow, but it is not architecturally or checkpoint compatible with BERT or ModernBERT. Its attention pattern, RoPE, RMSNorm, and SwiGLU differ. It does not include pretrained weights, checkpoint conversion, a full training runner/dataset pipeline, or benchmark results. The model is randomly initialized and must be pretrained or fine-tuned for useful representations.
 
 ## Development
 
@@ -74,7 +112,7 @@ Install the project and development tools in editable mode, then run tests and l
 ```bash
 python -m pip install -e ".[dev]"
 python -m pytest
-ruff check lara.py tests
+ruff check lara.py lara_tokenizer.py tests
 ```
 
 GitHub Actions runs the test and lint checks with CPU PyTorch on Python 3.10, 3.11, and 3.12.

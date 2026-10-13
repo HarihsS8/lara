@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "A bidirectional encoder-only Transformer in PyTorch"
 readme = "README.md"
 requires-python = ">=3.10"
-    dependencies = ["numpy>=1.23", "torch>=2.0", "safetensors>=0.4"]
+dependencies = ["numpy>=1.23", "torch>=2.0", "safetensors>=0.4", "tokenizers>=0.15"]
 
 [project.optional-dependencies]
 dev = [
@@ -17,7 +17,7 @@ dev = [
 ]
 
 [tool.setuptools]
-py-modules = ["lara"]
+py-modules = ["lara", "lara_tokenizer"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

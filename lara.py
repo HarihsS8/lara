@@ -59,6 +59,7 @@ class LaraConfig:
     hidden_dropout_prob: float = 0.0
     attention_dropout_prob: float = 0.0
     pad_token_id: int = 0
+    type_vocab_size: int = 2
     pooler_type: str = "mean"
 
     def __post_init__(self) -> None:
@@ -76,6 +77,8 @@ class LaraConfig:
             raise ValueError("attention head dimension must be even for RoPE")
         if self.intermediate_size <= 0 or self.max_position_embeddings <= 0:
             raise ValueError("intermediate_size and max_position_embeddings must be positive")
+        if self.type_vocab_size <= 0:
+            raise ValueError("type_vocab_size must be positive")
         if self.rope_theta <= 0 or self.rms_norm_eps <= 0:
             raise ValueError("rope_theta and rms_norm_eps must be positive")
         if self.local_window_size < 0 or self.num_global_tokens < 0:
@@ -123,6 +126,24 @@ class LaraTaskOutput:
     """Output from a task-specific head."""
 
     logits: Tensor
+    loss: Optional[Tensor] = None
+
+
+@dataclass
+class LaraPreTrainingOutput:
+    """Outputs for masked-token and next-sentence pretraining."""
+
+    prediction_logits: Tensor
+    next_sentence_logits: Tensor
+    loss: Optional[Tensor] = None
+
+
+@dataclass
+class LaraQuestionAnsweringOutput:
+    """Start/end logits and optional span loss for extractive QA."""
+
+    start_logits: Tensor
+    end_logits: Tensor
     loss: Optional[Tensor] = None
 
 
@@ -356,7 +377,7 @@ class LaraEncoderLayer(nn.Module):
 
 
 class LaraEmbeddings(nn.Module):
-    """Vocabulary embeddings for BPE or byte-fallback tokenizer IDs."""
+    """Token and segment embeddings for tokenizer-produced IDs."""
 
     def __init__(self, config: LaraConfig) -> None:
         super().__init__()
@@ -365,10 +386,82 @@ class LaraEmbeddings(nn.Module):
             config.hidden_size,
             padding_idx=config.pad_token_id,
         )
+        self.token_type_embeddings = nn.Embedding(config.type_vocab_size, config.hidden_size)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
-    def forward(self, input_ids: Tensor) -> Tensor:
-        return self.dropout(self.word_embeddings(input_ids))
+    def forward(self, input_ids: Tensor, token_type_ids: Optional[Tensor] = None) -> Tensor:
+        if token_type_ids is None:
+            token_type_ids = torch.zeros_like(input_ids)
+        if token_type_ids.shape != input_ids.shape:
+            raise ValueError("token_type_ids must have the same shape as input_ids")
+        if torch.any(token_type_ids < 0) or torch.any(
+            token_type_ids >= self.token_type_embeddings.num_embeddings
+        ):
+            raise ValueError("token_type_ids contain IDs outside type_vocab_size")
+        return self.dropout(
+            self.word_embeddings(input_ids) + self.token_type_embeddings(token_type_ids)
+        )
+
+
+class LaraPreTrainedModel(nn.Module):
+    """Base class for task models with safe, self-describing checkpoints."""
+
+    def __init__(self, config: LaraConfig) -> None:
+        super().__init__()
+        self.config = config
+
+    def _head_config(self) -> dict[str, object]:
+        return {}
+
+    def save_pretrained(self, save_directory: str | Path) -> None:
+        """Save task metadata and weights as JSON and Safetensors files."""
+        directory = Path(save_directory)
+        directory.mkdir(parents=True, exist_ok=True)
+        self.config.save_pretrained(directory)
+        _write_json_atomic(
+            directory / "model_config.json",
+            {"model_type": type(self).__name__, "head_config": self._head_config()},
+        )
+        state_dict = {
+            name: tensor.detach().to(device="cpu").contiguous()
+            for name, tensor in self.state_dict().items()
+        }
+        temporary_path: Optional[Path] = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                suffix=".safetensors", dir=directory, delete=False
+            ) as temporary_file:
+                temporary_path = Path(temporary_file.name)
+            save_file(state_dict, str(temporary_path))
+            os.replace(temporary_path, directory / "model.safetensors")
+        finally:
+            if temporary_path is not None and temporary_path.exists():
+                temporary_path.unlink()
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        directory: str | Path,
+        *,
+        map_location: str | torch.device = "cpu",
+        strict: bool = True,
+    ) -> LaraPreTrainedModel:
+        """Load a saved task model and validate its recorded model type."""
+        directory = Path(directory)
+        with (directory / "model_config.json").open(encoding="utf-8") as config_file:
+            model_config = json.load(config_file)
+        if not isinstance(model_config, dict) or model_config.get("model_type") != cls.__name__:
+            raise ValueError(f"Checkpoint does not contain a {cls.__name__} model")
+        head_config = model_config.get("head_config", {})
+        if not isinstance(head_config, dict):
+            raise ValueError("Invalid task-head configuration in checkpoint")
+        model = cls(LaraConfig.from_pretrained(directory), **head_config)
+        state_dict = load_file(
+            str(directory / "model.safetensors"),
+            device=str(map_location),
+        )
+        model.load_state_dict(state_dict, strict=strict)
+        return model
 
 
 class LaraModel(nn.Module):
@@ -429,7 +522,12 @@ class LaraModel(nn.Module):
         model.load_state_dict(state_dict, strict=strict)
         return model
 
-    def forward(self, input_ids: Tensor, attention_mask: Optional[Tensor] = None) -> LaraOutput:
+    def forward(
+        self,
+        input_ids: Tensor,
+        attention_mask: Optional[Tensor] = None,
+        token_type_ids: Optional[Tensor] = None,
+    ) -> LaraOutput:
         """Encode ``input_ids``; mask values of one indicate non-padding tokens."""
         if input_ids.ndim != 2:
             raise ValueError("input_ids must have shape [batch, sequence]")
@@ -444,7 +542,7 @@ class LaraModel(nn.Module):
                 raise ValueError("attention_mask must have the same shape as input_ids")
             token_mask = attention_mask.to(device=input_ids.device, dtype=torch.bool)
 
-        hidden_states = self.embeddings(input_ids)
+        hidden_states = self.embeddings(input_ids, token_type_ids)
         hidden_states = hidden_states * token_mask[:, :, None].to(hidden_states.dtype)
         for layer in self.layers:
             hidden_states = layer(hidden_states, token_mask)
@@ -453,37 +551,242 @@ class LaraModel(nn.Module):
         return LaraOutput(hidden_states, self._pool(hidden_states, token_mask))
 
 
-class LaraForSequenceClassification(nn.Module):
+class LaraForSequenceClassification(LaraPreTrainedModel):
     """Sequence-classification head over masked-mean or CLS pooled features."""
 
     def __init__(self, config: LaraConfig, num_labels: int) -> None:
-        super().__init__()
+        super().__init__(config)
         if num_labels <= 0:
             raise ValueError("num_labels must be positive")
+        self.num_labels = num_labels
         self.encoder = LaraModel(config)
         self.classifier = nn.Linear(config.hidden_size, num_labels)
+
+    def _head_config(self) -> dict[str, object]:
+        return {"num_labels": self.num_labels}
 
     def forward(
         self,
         input_ids: Tensor,
         attention_mask: Optional[Tensor] = None,
         labels: Optional[Tensor] = None,
+        token_type_ids: Optional[Tensor] = None,
     ) -> LaraTaskOutput:
-        pooled = self.encoder(input_ids, attention_mask).pooler_output
+        pooled = self.encoder(input_ids, attention_mask, token_type_ids).pooler_output
         logits = self.classifier(pooled)
-        loss = F.cross_entropy(logits, labels) if labels is not None else None
+        loss = None
+        if labels is not None:
+            if logits.shape[-1] == 1:
+                loss = F.mse_loss(logits.squeeze(-1), labels.to(logits.dtype).view(-1))
+            elif labels.is_floating_point():
+                loss = F.binary_cross_entropy_with_logits(logits, labels.to(logits.dtype))
+            else:
+                loss = F.cross_entropy(logits, labels.long())
         return LaraTaskOutput(logits=logits, loss=loss)
 
 
-class LaraForRetrieval(nn.Module):
+class LaraForTokenClassification(LaraPreTrainedModel):
+    """Token classification head for tasks such as NER and tagging."""
+
+    def __init__(self, config: LaraConfig, num_labels: int) -> None:
+        super().__init__(config)
+        if num_labels <= 0:
+            raise ValueError("num_labels must be positive")
+        self.num_labels = num_labels
+        self.encoder = LaraModel(config)
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        self.classifier = nn.Linear(config.hidden_size, num_labels)
+
+    def _head_config(self) -> dict[str, object]:
+        return {"num_labels": self.num_labels}
+
+    def forward(
+        self,
+        input_ids: Tensor,
+        attention_mask: Optional[Tensor] = None,
+        labels: Optional[Tensor] = None,
+        token_type_ids: Optional[Tensor] = None,
+    ) -> LaraTaskOutput:
+        hidden_states = self.encoder(input_ids, attention_mask, token_type_ids).last_hidden_state
+        logits = self.classifier(self.dropout(hidden_states))
+        loss = None
+        if labels is not None:
+            if labels.shape != input_ids.shape:
+                raise ValueError("token-classification labels must match input_ids shape")
+            loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), labels.reshape(-1).long())
+        return LaraTaskOutput(logits=logits, loss=loss)
+
+
+class LaraForQuestionAnswering(LaraPreTrainedModel):
+    """Extractive QA head predicting start and end token positions."""
+
+    def __init__(self, config: LaraConfig) -> None:
+        super().__init__(config)
+        self.encoder = LaraModel(config)
+        self.qa_outputs = nn.Linear(config.hidden_size, 2)
+
+    def forward(
+        self,
+        input_ids: Tensor,
+        attention_mask: Optional[Tensor] = None,
+        start_positions: Optional[Tensor] = None,
+        end_positions: Optional[Tensor] = None,
+        token_type_ids: Optional[Tensor] = None,
+    ) -> LaraQuestionAnsweringOutput:
+        hidden_states = self.encoder(input_ids, attention_mask, token_type_ids).last_hidden_state
+        start_logits, end_logits = self.qa_outputs(hidden_states).unbind(dim=-1)
+        loss = None
+        if (start_positions is None) != (end_positions is None):
+            raise ValueError("start_positions and end_positions must be provided together")
+        if start_positions is not None and end_positions is not None:
+            ignored_index = input_ids.shape[1]
+            start_positions = start_positions.reshape(-1).long().clamp(0, ignored_index)
+            end_positions = end_positions.reshape(-1).long().clamp(0, ignored_index)
+            loss = (
+                F.cross_entropy(start_logits, start_positions, ignore_index=ignored_index)
+                + F.cross_entropy(end_logits, end_positions, ignore_index=ignored_index)
+            ) / 2
+        return LaraQuestionAnsweringOutput(start_logits, end_logits, loss)
+
+
+class LaraForMultipleChoice(LaraPreTrainedModel):
+    """Multiple-choice classification over candidate sequences."""
+
+    def __init__(self, config: LaraConfig) -> None:
+        super().__init__(config)
+        self.encoder = LaraModel(config)
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        self.classifier = nn.Linear(config.hidden_size, 1)
+
+    def forward(
+        self,
+        input_ids: Tensor,
+        attention_mask: Optional[Tensor] = None,
+        labels: Optional[Tensor] = None,
+        token_type_ids: Optional[Tensor] = None,
+    ) -> LaraTaskOutput:
+        if input_ids.ndim != 3:
+            raise ValueError("multiple-choice input_ids must have shape [batch, choices, sequence]")
+        batch_size, num_choices, sequence_length = input_ids.shape
+        flat_input_ids = input_ids.reshape(batch_size * num_choices, sequence_length)
+        flat_attention_mask = (
+            attention_mask.reshape(batch_size * num_choices, sequence_length)
+            if attention_mask is not None
+            else None
+        )
+        flat_token_type_ids = (
+            token_type_ids.reshape(batch_size * num_choices, sequence_length)
+            if token_type_ids is not None
+            else None
+        )
+        pooled = self.encoder(
+            flat_input_ids, flat_attention_mask, flat_token_type_ids
+        ).pooler_output
+        logits = self.classifier(self.dropout(pooled)).reshape(batch_size, num_choices)
+        loss = None
+        if labels is not None:
+            if labels.shape != (batch_size,):
+                raise ValueError("multiple-choice labels must have shape [batch]")
+            loss = F.cross_entropy(logits, labels.long())
+        return LaraTaskOutput(logits=logits, loss=loss)
+
+
+class _LaraMLMHead(nn.Module):
+    """BERT-style dense/activation/norm transform before tied vocabulary logits."""
+
+    def __init__(self, config: LaraConfig, embeddings: LaraEmbeddings) -> None:
+        super().__init__()
+        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        self.layer_norm = nn.LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.decoder_weight = embeddings.word_embeddings.weight
+        self.decoder_bias = nn.Parameter(torch.zeros(config.vocab_size))
+
+    def forward(self, hidden_states: Tensor) -> Tensor:
+        hidden_states = self.layer_norm(F.gelu(self.dense(hidden_states)))
+        return F.linear(hidden_states, self.decoder_weight, self.decoder_bias)
+
+
+class LaraForMaskedLM(LaraPreTrainedModel):
+    """Masked language modeling head with embeddings tied to the decoder."""
+
+    def __init__(self, config: LaraConfig) -> None:
+        super().__init__(config)
+        self.encoder = LaraModel(config)
+        self.mlm_head = _LaraMLMHead(config, self.encoder.embeddings)
+
+    def forward(
+        self,
+        input_ids: Tensor,
+        attention_mask: Optional[Tensor] = None,
+        labels: Optional[Tensor] = None,
+        token_type_ids: Optional[Tensor] = None,
+    ) -> LaraTaskOutput:
+        hidden_states = self.encoder(input_ids, attention_mask, token_type_ids).last_hidden_state
+        logits = self.mlm_head(hidden_states)
+        loss = None
+        if labels is not None:
+            if labels.shape != input_ids.shape:
+                raise ValueError("masked-language-model labels must match input_ids shape")
+            loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), labels.reshape(-1).long())
+        return LaraTaskOutput(logits=logits, loss=loss)
+
+
+class LaraForPreTraining(LaraPreTrainedModel):
+    """BERT-style masked language modeling and next-sentence prediction."""
+
+    def __init__(self, config: LaraConfig) -> None:
+        super().__init__(config)
+        self.encoder = LaraModel(config)
+        self.mlm_head = _LaraMLMHead(config, self.encoder.embeddings)
+        self.pooler = nn.Sequential(
+            nn.Linear(config.hidden_size, config.hidden_size),
+            nn.Tanh(),
+        )
+        self.next_sentence_head = nn.Linear(config.hidden_size, 2)
+
+    def forward(
+        self,
+        input_ids: Tensor,
+        attention_mask: Optional[Tensor] = None,
+        token_type_ids: Optional[Tensor] = None,
+        labels: Optional[Tensor] = None,
+        next_sentence_labels: Optional[Tensor] = None,
+    ) -> LaraPreTrainingOutput:
+        encoded = self.encoder(input_ids, attention_mask, token_type_ids)
+        prediction_logits = self.mlm_head(encoded.last_hidden_state)
+        next_sentence_logits = self.next_sentence_head(self.pooler(encoded.last_hidden_state[:, 0]))
+        losses = []
+        if labels is not None:
+            if labels.shape != input_ids.shape:
+                raise ValueError("masked-language-model labels must match input_ids shape")
+            losses.append(
+                F.cross_entropy(
+                    prediction_logits.reshape(-1, prediction_logits.shape[-1]),
+                    labels.reshape(-1).long(),
+                )
+            )
+        if next_sentence_labels is not None:
+            if next_sentence_labels.shape != (input_ids.shape[0],):
+                raise ValueError("next_sentence_labels must have shape [batch]")
+            losses.append(F.cross_entropy(next_sentence_logits, next_sentence_labels.long()))
+        loss = torch.stack(losses).sum() if losses else None
+        return LaraPreTrainingOutput(prediction_logits, next_sentence_logits, loss)
+
+
+class LaraForRetrieval(LaraPreTrainedModel):
     """Encoder wrapper returning L2-normalized sentence embeddings."""
 
     def __init__(self, config: LaraConfig) -> None:
-        super().__init__()
+        super().__init__(config)
         self.encoder = LaraModel(config)
 
-    def forward(self, input_ids: Tensor, attention_mask: Optional[Tensor] = None) -> Tensor:
-        pooled = self.encoder(input_ids, attention_mask).pooler_output
+    def forward(
+        self,
+        input_ids: Tensor,
+        attention_mask: Optional[Tensor] = None,
+        token_type_ids: Optional[Tensor] = None,
+    ) -> Tensor:
+        pooled = self.encoder(input_ids, attention_mask, token_type_ids).pooler_output
         return F.normalize(pooled, p=2, dim=-1)
 
 

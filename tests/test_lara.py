@@ -36,6 +36,18 @@ def test_encoder_outputs_and_zeroes_padding(config: LaraConfig) -> None:
     assert torch.isfinite(outputs.last_hidden_state).all()
 
 
+def test_token_type_embeddings_distinguish_segments(config: LaraConfig) -> None:
+    model = LaraModel(config).eval()
+    input_ids = torch.tensor([[1, 2, 3]])
+    segment_a = torch.zeros_like(input_ids)
+    segment_b = torch.ones_like(input_ids)
+
+    output_a = model(input_ids, token_type_ids=segment_a).last_hidden_state
+    output_b = model(input_ids, token_type_ids=segment_b).last_hidden_state
+
+    assert not torch.equal(output_a, output_b)
+
+
 def test_masked_token_ids_do_not_affect_valid_representations(config: LaraConfig) -> None:
     model = LaraModel(config).eval()
     attention_mask = torch.tensor([[1, 1, 1, 0, 0]])
